@@ -1686,6 +1686,7 @@ impl Dataset {
             default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
+            None,
         )
         .await?;
 
