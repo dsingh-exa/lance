@@ -617,8 +617,9 @@ Readers that do not implement idempotency keys see an ordinary transaction prope
 A writer that adds the property must satisfy these constraints:
 
 - Every key is a non-empty string.
-- The array holds at most 4096 distinct keys, and the keys total at most 262144 bytes of UTF-8.
 - The array is not empty; a transaction without keys omits the property.
+
+Implementations may limit the number of keys per transaction and their total size, because every later check in the window reads them again.
 
 Two transactions whose key sets intersect conflict, and the conflict is **incompatible**: rebasing would apply the same work twice.
 When a writer commits a transaction with a non-empty key set, it checks every transaction committed at a version after the transaction's `read_version` up to the version being created, before applying any other conflict rule to them.
