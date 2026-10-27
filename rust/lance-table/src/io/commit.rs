@@ -23,6 +23,7 @@
 //! alternative to [CommitHandler].
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -1660,29 +1661,37 @@ fn manifest_multipart_threshold() -> usize {
 ///
 /// Uses a multipart upload when `data` is larger than `multipart_threshold` and the store
 /// enforces [`PutMode::Create`] at multipart completion; otherwise a single conditional PUT.
+/// The multipart upload keeps up to `upload_parallelism` parts in flight.
 /// An existing object is reported as [`CommitError::CommitConflict`] on either path.
 async fn put_manifest_if_absent(
     object_store: &ObjectStore,
     path: &Path,
     data: Bytes,
     multipart_threshold: usize,
+    upload_parallelism: usize,
 ) -> std::result::Result<PutResult, CommitError> {
-    let res =
-        if object_store.supports_conditional_multipart_put() && data.len() > multipart_threshold {
-            put_multipart_if_absent(object_store.inner.as_ref(), path, data).await
-        } else {
-            object_store
-                .inner
-                .put_opts(
-                    path,
-                    data.into(),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    },
-                )
-                .await
-        };
+    let res = if object_store.supports_conditional_multipart_put()
+        && data.len() > multipart_threshold
+    {
+        let upload_parallelism = NonZeroUsize::new(upload_parallelism).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "LANCE_UPLOAD_CONCURRENCY must be greater than zero, got {upload_parallelism}"
+            ))
+        })?;
+        put_multipart_if_absent(object_store.inner.as_ref(), path, data, upload_parallelism).await
+    } else {
+        object_store
+            .inner
+            .put_opts(
+                path,
+                data.into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+    };
     res.map_err(|err| match err {
         ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
             CommitError::CommitConflict
@@ -1696,6 +1705,7 @@ async fn put_multipart_if_absent(
     store: &dyn OSObjectStore,
     path: &Path,
     data: Bytes,
+    upload_parallelism: NonZeroUsize,
 ) -> object_store::Result<PutResult> {
     // S3 allows at most 10,000 parts per upload.
     const MAX_PARTS: usize = 10_000;
@@ -1713,7 +1723,7 @@ async fn put_multipart_if_absent(
     let uploaded = futures::stream::iter(
         split_into_parts(&data, part_size).map(|part| upload.put_part(part.into())),
     )
-    .buffer_unordered(max_upload_parallelism())
+    .buffer_unordered(upload_parallelism.get())
     .try_collect::<()>()
     .await;
     let res = match uploaded {
@@ -1781,6 +1791,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
             &path,
             dummy_data,
             manifest_multipart_threshold(),
+            max_upload_parallelism(),
         )
         .await?;
 
@@ -2885,9 +2896,15 @@ mod tests {
         let part_size = initial_upload_size();
         let data = Bytes::from((0..2 * part_size + 1).map(|i| i as u8).collect::<Vec<_>>());
 
-        put_manifest_if_absent(&object_store, &MANIFEST_PATH.into(), data.clone(), 1024)
-            .await
-            .unwrap();
+        put_manifest_if_absent(
+            &object_store,
+            &MANIFEST_PATH.into(),
+            data.clone(),
+            1024,
+            max_upload_parallelism(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(observations.single_puts.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -2909,7 +2926,9 @@ mod tests {
         object_store.put(&path, b"existing").await.unwrap();
 
         let data = Bytes::from(vec![7u8; initial_upload_size() + 1]);
-        let result = put_manifest_if_absent(&object_store, &path, data, 1024).await;
+        let result =
+            put_manifest_if_absent(&object_store, &path, data, 1024, max_upload_parallelism())
+                .await;
 
         assert!(
             matches!(result, Err(CommitError::CommitConflict)),
@@ -2922,12 +2941,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_put_manifest_if_absent_rejects_zero_upload_parallelism() {
+        let (object_store, observations) = observed_store(true, false);
+        let path = Path::from(MANIFEST_PATH);
+
+        let data = Bytes::from(vec![7u8; initial_upload_size() + 1]);
+        let result = put_manifest_if_absent(&object_store, &path, data, 1024, 0).await;
+
+        let Err(CommitError::OtherError(error)) = result else {
+            panic!("zero upload parallelism must be rejected, got {result:?}");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("LANCE_UPLOAD_CONCURRENCY"));
+        assert!(error.to_string().contains("got 0"));
+        assert!(observations.part_sizes.lock().unwrap().is_empty());
+        assert_eq!(observations.single_puts.load(Ordering::SeqCst), 0);
+        assert!(!object_store.exists(&path).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn test_put_manifest_if_absent_aborts_failed_multipart() {
         let (object_store, observations) = observed_store(true, true);
         let path = Path::from(MANIFEST_PATH);
 
         let data = Bytes::from(vec![7u8; initial_upload_size() + 1]);
-        let result = put_manifest_if_absent(&object_store, &path, data, 1024).await;
+        let result =
+            put_manifest_if_absent(&object_store, &path, data, 1024, max_upload_parallelism())
+                .await;
 
         assert!(
             matches!(result, Err(CommitError::OtherError(_))),
@@ -2949,10 +2989,23 @@ mod tests {
         let path = Path::from(MANIFEST_PATH);
         let data = Bytes::from_static(b"abcd");
 
-        put_manifest_if_absent(&object_store, &path, data.clone(), threshold)
-            .await
-            .unwrap();
-        let result = put_manifest_if_absent(&object_store, &path, data, threshold).await;
+        put_manifest_if_absent(
+            &object_store,
+            &path,
+            data.clone(),
+            threshold,
+            max_upload_parallelism(),
+        )
+        .await
+        .unwrap();
+        let result = put_manifest_if_absent(
+            &object_store,
+            &path,
+            data,
+            threshold,
+            max_upload_parallelism(),
+        )
+        .await;
 
         assert!(
             matches!(result, Err(CommitError::CommitConflict)),
